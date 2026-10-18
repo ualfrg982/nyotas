@@ -18,3 +18,4 @@ Lista de cambios en cada versión:
 ñotas_v1.13 : Uniones añadidas.
 ñotas_v1.14 : Escritura y menú contextual, arreglado.
 ñotas_v1.15 : Atajos añadidos.
+ñotas_v1.16 : Optimización del renderizado y fix de memoria.
