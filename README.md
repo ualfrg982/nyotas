@@ -1,6 +1,9 @@
 # ñotas
 ñotas es un tablero en HTML para crear notas, esquemas, y organizar ideas.
 
+<img width="1872" height="907" alt="image" src="https://github.com/user-attachments/assets/3badf76d-13b9-46ba-9aaf-e2f90bc9c4d8" />
+
+
 ## Controles y atajos del teclado
 
 Doble click para crear o editar nota.
