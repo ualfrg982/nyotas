@@ -1,0 +1,573 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ñotas</title>
+<style>
+  body {
+    margin: 0;
+    height: 100vh;
+    background: #f0f0f0; 
+    color: black;
+    font-family: sans-serif;
+    overflow: hidden;
+    transition: background-color 0.5s, color 0.5s;
+  }
+  #board {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    overflow: hidden;
+  }
+  .note {
+    position: absolute;
+    min-width: 48px;
+    max-width: 400px;
+    background: white;
+    border: 2px solid black;
+    border-radius: 10px;
+    padding: 8px 10px;
+    box-sizing: border-box;
+    user-select: none;
+    cursor: grab;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    text-align: center;
+  }
+  .note:active { cursor: grabbing; }
+  .note.selected { outline: 2px dashed #00aaff; }
+  .placeholder { color: #bbb; font-style: italic; }
+
+  .union-line {
+    stroke: black;
+    stroke-width: 1.5;
+    pointer-events: none;
+  }
+
+  .selection-rect {
+    position: absolute;
+    border: 1px dashed #00aaff;
+    background: rgba(0, 170, 255, 0.15);
+    pointer-events: none;
+    z-index: 9999;
+  }
+
+  .context-menu {
+    position: absolute;
+    background: white;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    display: none;
+    z-index: 10000;
+    overflow: hidden;
+  }
+  .context-menu button {
+    display: block;
+    width: 100%;
+    padding: 10px 20px;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .context-menu button:hover {
+    background: #0078d4;
+    color: white;
+  }
+  
+  body.dark-mode { background: #000000; color: #f0f0f0; }
+  .dark-mode .note { background: #202020; border: 2px solid #888; color: #e0e0e0; }
+  .dark-mode .union-line { stroke: #888; }
+  .dark-mode .context-menu { background: #2d2d30; border: 1px solid #444; }
+  .dark-mode .context-menu button { color: #e0e0e0; }
+</style>
+</head>
+<body>
+<div id="board">
+    <svg id="unions-layer" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; pointer-events: none;"></svg>
+</div>
+
+<div id="context-menu" class="context-menu">
+  <button id="new-note">🟨 Nueva nota</button>
+  <button id="load-schema">📂 Cargar esquema (Ctrl+O)</button>
+  <button id="save-schema">💾 Guardar esquema (Ctrl+S)</button>
+  <button id="save-image">🖼️ Guardar imagen (Ctrl+P)</button>
+  <button id="toggle-dark-mode">🌙 Alternar Tema Oscuro</button>
+</div>
+
+<div id="context-menu-note" class="context-menu">
+  <button id="delete-note">🗑️ Eliminar</button>
+  <button id="duplicate-note">📄 Duplicar</button>
+  <button id="merge-notes">🔗 Fusionar</button>
+  <button id="toggle-union">📏 Unir / Separar</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script>
+/* =====================================================================
+   VARIABLES Y ESTADO
+   ===================================================================== */
+const board=document.getElementById("board");
+const unionsLayer=document.getElementById("unions-layer");
+const menuBg=document.getElementById("context-menu");
+const menuNote=document.getElementById("context-menu-note");
+const btnToggleUnion=document.getElementById("toggle-union");
+
+let notes=[];
+let unions=[]; 
+let selectedIds=new Set();
+let zCounter=1;
+let ctrlHeld=false;
+let contextClickPos={x:0,y:0};
+let selectionStart=null;
+let selectionRect=null;
+let wasSelecting=false;
+let history = []; 
+let redoStack = []; 
+const MAX_HISTORY = 200;
+
+/* =====================================================================
+   COMANDOS (UNDO / REDO)
+   ===================================================================== */
+function ToggleUnionCommand(idA, idB) {
+    this.idA = idA; this.idB = idB;
+    this.existingUnion = unions.find(u => (u.from === idA && u.to === idB) || (u.from === idB && u.to === idA));
+    this.newUnion = null;
+    this.affectedZIndexes = [];
+
+    this.execute = () => {
+        if (this.existingUnion) {
+            unions = unions.filter(u => u.id !== this.existingUnion.id);
+        } else {
+            const nA = notes.find(n => n.id === this.idA);
+            const nB = notes.find(n => n.id === this.idB);
+            const minZ = Math.min(nA.z, nB.z);
+            this.affectedZIndexes = notes.filter(n => n.z >= minZ).map(n => ({id: n.id, oldZ: n.z}));
+            notes.forEach(n => { if(n.z >= minZ) n.z++; });
+            this.newUnion = { id: crypto.randomUUID(), from: this.idA, to: this.idB, z: minZ };
+            unions.push(this.newUnion);
+            zCounter++;
+        }
+    };
+    this.undo = () => {
+        if (this.existingUnion) { unions.push(this.existingUnion); }
+        else {
+            unions = unions.filter(u => u.id !== this.newUnion.id);
+            this.affectedZIndexes.forEach(item => { const n = notes.find(note => note.id === item.id); if(n) n.z = item.oldZ; });
+            zCounter--;
+        }
+    };
+}
+
+function NewNoteCommand(note) {
+    this.note = note;
+    this.execute = () => { notes.push(this.note); };
+    this.undo = () => { notes = notes.filter(n => n.id !== this.note.id); };
+}
+
+function EditNoteCommand(id, textBefore, textAfter) {
+    this.id = id; this.textBefore = textBefore; this.textAfter = textAfter;
+    this.execute = () => { const n = notes.find(n => n.id === this.id); if(n) n.text = this.textAfter; };
+    this.undo = () => { const n = notes.find(n => n.id === this.id); if(n) n.text = this.textBefore; };
+}
+
+function MoveNotesCommand(posBefore, posAfter) {
+    this.posBefore = posBefore; this.posAfter = posAfter;
+    const apply = (p) => p.forEach(item => { const n = notes.find(x => x.id === item.id); if(n){ n.x=item.x; n.y=item.y; }});
+    this.execute = () => apply(this.posAfter);
+    this.undo = () => apply(this.posBefore);
+}
+
+function DeleteNotesCommand(dNotes, dUnions) {
+    this.dNotes = dNotes; this.dUnions = dUnions;
+    this.execute = () => {
+        const ids = new Set(this.dNotes.map(n => n.id));
+        notes = notes.filter(n => !ids.has(n.id));
+        const uids = new Set(this.dUnions.map(u => u.id));
+        unions = unions.filter(u => !uids.has(u.id));
+    };
+    this.undo = () => {
+        this.dNotes.forEach(dn => {
+            const idx = notes.findIndex(n => n.z > dn.z);
+            if(idx === -1) notes.push(dn); else notes.splice(idx, 0, dn);
+        });
+        unions = [...unions, ...this.dUnions];
+    };
+}
+
+function DuplicateNotesCommand(nNotes, nUnions) {
+    this.nNotes = nNotes; this.nUnions = nUnions;
+    this.execute = () => { notes = [...notes, ...this.nNotes]; unions = [...unions, ...this.nUnions]; };
+    this.undo = () => {
+        const ids = new Set(this.nNotes.map(n => n.id));
+        notes = notes.filter(n => !ids.has(n.id));
+        const uids = new Set(this.nUnions.map(u => u.id));
+        unions = unions.filter(u => !uids.has(u.id));
+    };
+}
+
+function MergeNotesCommand(targetId, tBefore, tAfter, dNotes, uBefore, uAfter) {
+    this.targetId = targetId; this.tBefore = tBefore; this.tAfter = tAfter;
+    this.dNotes = dNotes; this.uBefore = uBefore; this.uAfter = uAfter;
+    this.execute = () => {
+        const n = notes.find(x => x.id === this.targetId); if(n) n.text = this.tAfter;
+        const ids = new Set(this.dNotes.map(x => x.id));
+        notes = notes.filter(x => !ids.has(x.id));
+        const ubIds = new Set(this.uBefore.map(u => u.id));
+        unions = unions.filter(u => !ubIds.has(u.id));
+        unions = [...unions, ...this.uAfter];
+    };
+    this.undo = () => {
+        const n = notes.find(x => x.id === this.targetId); if(n) n.text = this.tBefore;
+        notes = [...notes, ...this.dNotes].sort((a,b)=>a.z-b.z);
+        const uaIds = new Set(this.uAfter.map(u => u.id));
+        unions = unions.filter(u => !uaIds.has(u.id));
+        unions = [...unions, ...this.uBefore];
+    };
+}
+
+function executeCommand(cmd) {
+    history.push(cmd);
+    if(history.length > MAX_HISTORY) history.shift();
+    redoStack = []; cmd.execute(); render();
+}
+
+function undo() {
+    if(history.length === 0) return;
+    const cmd = history.pop(); cmd.undo(); redoStack.push(cmd);
+    selectedIds.clear(); render();
+}
+
+function redo() {
+    if(redoStack.length === 0) return;
+    const cmd = redoStack.pop(); cmd.execute(); history.push(cmd);
+    selectedIds.clear(); render();
+}
+
+/* =====================================================================
+   LÓGICA DE RENDER
+   ===================================================================== */
+function renderUnions() {
+    unionsLayer.innerHTML = '';
+    unions.forEach(u => {
+        const nA = notes.find(n => n.id === u.from);
+        const nB = notes.find(n => n.id === u.to);
+        if(!nA || !nB) return;
+        const elA = document.querySelector(`.note[data-id="${nA.id}"]`);
+        const elB = document.querySelector(`.note[data-id="${nB.id}"]`);
+        const wA = elA ? elA.offsetWidth : 100, hA = elA ? elA.offsetHeight : 50;
+        const wB = elB ? elB.offsetWidth : 100, hB = elB ? elB.offsetHeight : 50;
+        const x1 = nA.x + wA/2, y1 = nA.y + hA/2, x2 = nB.x + wB/2, y2 = nB.y + hB/2;
+        const line = document.createElementNS("http://www.w3.org/2000/svg", "line");
+        line.setAttribute("x1", x1); line.setAttribute("y1", y1); line.setAttribute("x2", x2); line.setAttribute("y2", y2);
+        line.setAttribute("class", "union-line");
+        line.style.zIndex = u.z;
+        unionsLayer.appendChild(line);
+    });
+}
+
+function render() {
+    board.querySelectorAll(".note").forEach(n => n.remove());
+    notes.slice().sort((a,b) => a.z - b.z).forEach(n => {
+        const el = document.createElement("div");
+        el.className = "note" + (selectedIds.has(n.id) ? " selected" : "");
+        el.style.left = n.x + "px"; el.style.top = n.y + "px"; el.style.zIndex = n.z;
+        el.dataset.id = n.id;
+        el.textContent = n.text.trim() === "" ? "" : n.text;
+        if(n.text.trim() === "") {
+            const ph = document.createElement("span"); ph.className = "placeholder"; ph.textContent = "..."; el.appendChild(ph);
+        }
+
+        let dragging = false, lastX = 0, lastY = 0, posBefore = [];
+        el.addEventListener("mousedown", e => {
+            if(e.detail > 1 || el.isContentEditable) return;
+            e.stopPropagation();
+            if(e.ctrlKey) {
+                if(selectedIds.has(n.id)) selectedIds.delete(n.id); else selectedIds.add(n.id);
+                render(); return;
+            }
+            if(!selectedIds.has(n.id)) { selectedIds.clear(); selectedIds.add(n.id); }
+            bringToFront();
+            posBefore = notes.filter(x => selectedIds.has(x.id)).map(x => ({id: x.id, x: x.x, y: x.y}));
+            dragging = true; lastX = e.clientX; lastY = e.clientY;
+            const up = () => {
+                if(!dragging) return; dragging = false;
+                const posAfter = notes.filter(x => selectedIds.has(x.id)).map(x => ({id: x.id, x: x.x, y: x.y}));
+                if(JSON.stringify(posBefore) !== JSON.stringify(posAfter)) executeCommand(new MoveNotesCommand(posBefore, posAfter));
+                window.removeEventListener("mouseup", up);
+            };
+            window.addEventListener("mouseup", up);
+        });
+
+        window.addEventListener("mousemove", e => {
+            if(!dragging) return;
+            const dx = e.clientX - lastX; const dy = e.clientY - lastY;
+            lastX = e.clientX; lastY = e.clientY;
+            notes.filter(x => selectedIds.has(x.id)).forEach(x => {
+                x.x += dx; x.y += dy;
+                const el2 = document.querySelector(`.note[data-id="${x.id}"]`);
+                if(el2) { el2.style.left = x.x + "px"; el2.style.top = x.y + "px"; }
+            });
+            renderUnions();
+        });
+
+        el.addEventListener("dblclick", e => { e.stopPropagation(); startEditing(el, n.id); });
+
+        el.addEventListener("contextmenu", e => {
+            e.preventDefault(); e.stopPropagation();
+            if(!selectedIds.has(n.id)) { selectedIds.clear(); selectedIds.add(n.id); render(); }
+            
+            document.getElementById("merge-notes").style.display = (selectedIds.size >= 2) ? 'block' : 'none';
+            if(selectedIds.size === 2) {
+                const ids = Array.from(selectedIds);
+                const exists = unions.some(u => (u.from === ids[0] && u.to === ids[1]) || (u.from === ids[1] && u.to === ids[0]));
+                btnToggleUnion.textContent = exists ? "📏 Separar" : "📏 Unir";
+                btnToggleUnion.style.display = 'block';
+            } else {
+                btnToggleUnion.style.display = 'none';
+            }
+
+            menuNote.style.display = "block"; menuNote.style.left = e.clientX + "px"; menuNote.style.top = e.clientY + "px";
+        });
+        board.appendChild(el);
+    });
+    renderUnions();
+}
+
+/* =====================================================================
+   ACCIONES
+   ===================================================================== */
+function bringToFront() {
+    if(selectedIds.size === 0) return;
+    const maxZ = Math.max(...notes.map(n => n.z), ...unions.map(u => u.z), 0);
+    let nextZ = maxZ + 1;
+    notes.filter(n => selectedIds.has(n.id)).forEach(n => n.z = nextZ++);
+    zCounter = nextZ; render();
+}
+
+function startEditing(el, id) {
+    const note = notes.find(n => n.id === id); if(!note) return;
+    const textBefore = note.text;
+    el.contentEditable = true; el.focus();
+    const ph = el.querySelector(".placeholder"); if(ph) ph.remove();
+    
+    const range = document.createRange(); const sel = window.getSelection();
+    range.selectNodeContents(el); range.collapse(false);
+    sel.removeAllRanges(); sel.addRange(range);
+
+    const handleKey = (e) => {
+        if(e.key === "Enter" && !e.shiftKey) {
+            e.preventDefault(); el.blur();
+        }
+    };
+    const finish = () => {
+        el.removeEventListener("blur", finish); el.removeEventListener("keydown", handleKey);
+        el.contentEditable = false;
+        const textAfter = el.textContent.trim();
+        if(textBefore !== textAfter) executeCommand(new EditNoteCommand(id, textBefore, textAfter)); else render();
+    };
+    el.addEventListener("blur", finish);
+    el.addEventListener("keydown", handleKey);
+}
+
+// Botones de Menú Fondo
+document.getElementById("new-note").onclick = () => {
+    const note = { id: crypto.randomUUID(), x: contextClickPos.x, y: contextClickPos.y, text: "", z: ++zCounter };
+    executeCommand(new NewNoteCommand(note));
+    selectedIds.clear(); selectedIds.add(note.id); bringToFront();
+    setTimeout(() => { const el = document.querySelector(`.note[data-id="${note.id}"]`); if(el) startEditing(el, note.id); }, 50);
+    menuBg.style.display = "none";
+};
+
+document.getElementById("save-schema").onclick = () => {
+    const blob = new Blob([JSON.stringify({notes, unions}, null, 2)], {type: "application/json"});
+    const a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "esquema.json"; a.click();
+    menuBg.style.display = "none";
+};
+
+document.getElementById("load-schema").onclick = () => {
+    const input = document.createElement("input"); input.type = "file";
+    input.onchange = e => {
+        const reader = new FileReader();
+        reader.onload = () => {
+            const data = JSON.parse(reader.result);
+            notes = Array.isArray(data) ? data : (data.notes || []);
+            unions = Array.isArray(data) ? [] : (data.unions || []);
+            zCounter = Math.max(...notes.map(n=>n.z), ...unions.map(u=>u.z), 0) + 1;
+            history = []; redoStack = []; selectedIds.clear(); render();
+        };
+        reader.readAsText(e.target.files[0]);
+    };
+    input.click();
+    menuBg.style.display = "none";
+};
+
+document.getElementById("save-image").onclick = async () => {
+    menuBg.style.display = "none";
+    const bg = confirm("¿Fondo transparente?") ? null : (document.body.classList.contains('dark-mode') ? "#000000" : "#f0f0f0");
+    const canvas = await html2canvas(board, { backgroundColor: bg, useCORS: true });
+    const a = document.createElement("a"); a.download = "esquema.png"; a.href = canvas.toDataURL(); a.click();
+};
+
+document.getElementById("toggle-dark-mode").onclick = () => {
+    const isDark = document.body.classList.toggle('dark-mode');
+    document.getElementById("toggle-dark-mode").textContent = isDark ? '☀️ Tema Claro' : '🌙 Tema Oscuro';
+    localStorage.setItem('darkMode', isDark ? 'enabled' : 'disabled');
+    menuBg.style.display = "none";
+};
+
+// Botones de Menú Nota
+document.getElementById("delete-note").onclick = () => {
+    const dNotes = notes.filter(n => selectedIds.has(n.id));
+    const dUnions = unions.filter(u => selectedIds.has(u.from) || selectedIds.has(u.to));
+    executeCommand(new DeleteNotesCommand(dNotes, dUnions));
+    selectedIds.clear(); menuNote.style.display = "none";
+};
+
+document.getElementById("duplicate-note").onclick = () => {
+    if (selectedIds.size === 0) return;
+    const sel = notes.filter(n => selectedIds.has(n.id));
+    const idMap = new Map();
+    const nNotes = sel.map(n => {
+        const newId = crypto.randomUUID(); idMap.set(n.id, newId);
+        return { ...n, id: newId, x: n.x + 20, y: n.y + 20, z: ++zCounter };
+    });
+    const nUnions = [];
+    unions.forEach(u => {
+        const fromSel = idMap.has(u.from), toSel = idMap.has(u.to);
+        if(fromSel && toSel) nUnions.push({ id: crypto.randomUUID(), from: idMap.get(u.from), to: idMap.get(u.to), z: ++zCounter });
+        else if(fromSel || toSel) nUnions.push({ id: crypto.randomUUID(), from: fromSel ? idMap.get(u.from) : u.from, to: toSel ? idMap.get(u.to) : u.to, z: ++zCounter });
+    });
+    executeCommand(new DuplicateNotesCommand(nNotes, nUnions));
+    selectedIds = new Set(nNotes.map(n => n.id)); bringToFront();
+    menuNote.style.display = "none";
+};
+
+document.getElementById("merge-notes").onclick = () => {
+    if (selectedIds.size < 2) return;
+    const sel = notes.filter(n => selectedIds.has(n.id)).sort((a,b) => a.y - b.y);
+    const target = sel[0], tBefore = target.text, tAfter = sel.map(n => n.text).join('\n\n');
+    const uBefore = unions.filter(u => selectedIds.has(u.from) || selectedIds.has(u.to));
+    const uMap = new Map();
+    uBefore.forEach(u => {
+        const nFrom = selectedIds.has(u.from) ? target.id : u.from;
+        const nTo = selectedIds.has(u.to) ? target.id : u.to;
+        if(nFrom !== nTo) {
+            const key = [nFrom, nTo].sort().join('-');
+            if(!uMap.has(key)) uMap.set(key, { id: crypto.randomUUID(), from: nFrom, to: nTo, z: u.z });
+        }
+    });
+    executeCommand(new MergeNotesCommand(target.id, tBefore, tAfter, sel.slice(1), uBefore, Array.from(uMap.values())));
+    selectedIds.clear(); selectedIds.add(target.id); menuNote.style.display = "none";
+};
+
+btnToggleUnion.onclick = () => {
+    if (selectedIds.size !== 2) return;
+    const ids = Array.from(selectedIds);
+    executeCommand(new ToggleUnionCommand(ids[0], ids[1]));
+    menuNote.style.display = "none";
+};
+
+/* =====================================================================
+   EVENTOS GLOBALES
+   ===================================================================== */
+board.addEventListener("contextmenu", e => {
+    if(e.target !== board) return; e.preventDefault();
+    menuNote.style.display = "none";
+    const r = board.getBoundingClientRect(); contextClickPos = { x: e.clientX - r.left, y: e.clientY - r.top };
+    menuBg.style.display = "block"; menuBg.style.left = e.clientX + "px"; menuBg.style.top = e.clientY + "px";
+});
+
+document.addEventListener("click", e => {
+    if(!menuBg.contains(e.target)) menuBg.style.display = "none";
+    if(!menuNote.contains(e.target)) menuNote.style.display = "none";
+});
+
+board.addEventListener("dblclick", e => { 
+    if(e.target === board) {
+        const r = board.getBoundingClientRect();
+        contextClickPos = { x: e.clientX - r.left, y: e.clientY - r.top };
+        document.getElementById("new-note").onclick(); 
+    }
+});
+
+window.addEventListener("keydown", e => {
+    ctrlHeld = e.ctrlKey; 
+    const isEdit = document.activeElement.contentEditable === 'true' || document.activeElement.tagName === 'INPUT';
+    
+    // Atajos con Ctrl
+    if(e.ctrlKey) {
+        if(e.key.toLowerCase()==="z") { e.preventDefault(); if(e.shiftKey) redo(); else undo(); }
+        if(e.key.toLowerCase()==="y") { e.preventDefault(); redo(); }
+        if(e.key.toLowerCase()==="s") { e.preventDefault(); document.getElementById("save-schema").onclick(); }
+        if(e.key.toLowerCase()==="o") { e.preventDefault(); document.getElementById("load-schema").onclick(); }
+        if(e.key.toLowerCase()==="p") { e.preventDefault(); document.getElementById("save-image").onclick(); }
+        if(e.key.toLowerCase()==="a" && !isEdit) { e.preventDefault(); selectedIds = new Set(notes.map(n => n.id)); render(); }
+    }
+
+    // Atajos de selección (SOLO si no se está editando texto)
+    if(!isEdit && selectedIds.size > 0) {
+        // Unir / Separar con Espacio (solo 2 notas)
+        if(e.code === "Space" && selectedIds.size === 2) {
+            e.preventDefault();
+            btnToggleUnion.onclick();
+        }
+        // Duplicar con D
+        if(e.key.toLowerCase() === "d") {
+            e.preventDefault();
+            document.getElementById("duplicate-note").onclick();
+        }
+        // Fusionar con F
+        if(e.key.toLowerCase() === "f" && selectedIds.size >= 2) {
+            e.preventDefault();
+            document.getElementById("merge-notes").onclick();
+        }
+        // Borrar
+        if(e.key==="Delete"||e.key==="Backspace") {
+            e.preventDefault();
+            document.getElementById("delete-note").onclick();
+        }
+    }
+});
+
+window.addEventListener("keyup", e => { ctrlHeld = e.ctrlKey; });
+
+board.addEventListener("mousedown", e => {
+    if(e.target !== board) return; e.preventDefault();
+    const r = board.getBoundingClientRect(); selectionStart = { x: e.clientX - r.left, y: e.clientY - r.top };
+    selectionRect = document.createElement("div"); selectionRect.className = "selection-rect"; board.appendChild(selectionRect);
+    wasSelecting = false;
+});
+
+window.addEventListener("mousemove", e => {
+    if(!selectionStart) return;
+    const r = board.getBoundingClientRect(); const x = e.clientX - r.left, y = e.clientY - r.top;
+    const x1 = Math.min(selectionStart.x, x), y1 = Math.min(selectionStart.y, y), x2 = Math.max(selectionStart.x, x), y2 = Math.max(selectionStart.y, y);
+    Object.assign(selectionRect.style, { left: x1+"px", top: y1+"px", width: (x2-x1)+"px", height: (y2-y1)+"px" });
+    wasSelecting = true;
+    const newly = new Set();
+    notes.forEach(n => {
+        const el = document.querySelector(`.note[data-id="${n.id}"]`); if(!el) return;
+        const nr = el.getBoundingClientRect(); const br = board.getBoundingClientRect();
+        const nx1 = nr.left-br.left, ny1 = nr.top-br.top, nx2 = nx1+nr.width, ny2 = ny1+nr.height;
+        if(!(nx2<x1 || nx1>x2 || ny2<y1 || ny1>y2)) newly.add(n.id);
+    });
+    selectedIds = ctrlHeld ? new Set([...selectedIds, ...newly]) : newly; render();
+});
+
+window.addEventListener("mouseup", () => { if(selectionRect) selectionRect.remove(); selectionRect = null; selectionStart = null; });
+board.addEventListener("click", e => { if(e.target === board && !wasSelecting) { selectedIds.clear(); render(); } wasSelecting = false; });
+
+(function init() {
+    if(localStorage.getItem('darkMode') === 'enabled') {
+        document.body.classList.add('dark-mode');
+        document.getElementById("toggle-dark-mode").textContent = '☀️ Alternar Tema Claro';
+    }
+    render();
+})();
+</script>
+</body>
+</html>
