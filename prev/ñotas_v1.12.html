@@ -1,0 +1,933 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ñotas</title>
+<style>
+  /* Estilos de la aplicación base */
+  body {
+	margin: 0;
+	height: 100vh;
+	background: #f0f0f0; /* Fondo claro */
+	color: black;
+	font-family: sans-serif;
+	overflow: hidden;
+	transition: background-color 0.5s, color 0.5s; /* Transición suave */
+  }
+  #board {
+	width: 100%;
+	height: 100%;
+	position: relative;
+	overflow: hidden;
+  }
+  .note {
+    position: absolute;
+    min-width: 48px;
+    max-width: 400px;
+    background: white;
+    border: 2px solid black;
+    border-radius: 10px;
+    padding: 8px 10px;
+    box-sizing: border-box;
+    user-select: none;
+    cursor: grab;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    text-align: center;
+  }
+  .note:active { cursor: grabbing; }
+  .note.selected { outline: 2px dashed #00aaff; }
+  .placeholder { color: #bbb; font-style: italic; }
+
+  .selection-rect {
+    position: absolute;
+    border: 1px dashed #00aaff;
+    background: rgba(0, 170, 255, 0.15);
+    pointer-events: none;
+    z-index: 9999;
+  }
+
+  .context-menu {
+    position: absolute;
+    background: white;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    display: none;
+    z-index: 10000;
+    overflow: hidden;
+  }
+  .context-menu button {
+    display: block;
+    width: 100%;
+    padding: 10px 20px;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .context-menu button:hover {
+    background: #0078d4;
+    color: white;
+  }
+  
+  /* Estilos del TEMA OSCURO */
+  body.dark-mode {
+    background: #000000; /* Fondo negro */
+    color: #f0f0f0;
+  }
+  .dark-mode .note {
+    background: #202020; /* Fondo de nota oscura */
+    border: 2px solid #888;
+    color: #e0e0e0;
+  }
+  .dark-mode .note.selected {
+    outline: 2px dashed #00aaff;
+  }
+  .dark-mode .placeholder {
+    color: #777;
+  }
+  .dark-mode .context-menu {
+    background: #2d2d30;
+    border: 1px solid #444;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.5);
+  }
+  .dark-mode .context-menu button {
+    color: #e0e0e0;
+  }
+  .dark-mode .context-menu button:hover {
+    background: #0078d4;
+    color: white;
+  }
+  
+</style>
+</head>
+<body>
+<div id="board"></div>
+
+<div id="context-menu" class="context-menu">
+  <button id="new-note">🟨 Nueva nota</button>
+  <button id="load-schema">📂 Cargar esquema (Ctrl+O)</button>
+  <button id="save-schema">💾 Guardar esquema (Ctrl+S)</button>
+  <button id="save-image">🖼️ Guardar imagen (Ctrl+P)</button>
+  <button id="toggle-dark-mode">🌙 Tema Oscuro</button>
+</div>
+
+<div id="context-menu-note" class="context-menu">
+  <button id="delete-note">🗑️ Eliminar</button>
+  <button id="duplicate-note">📄 Duplicar</button>
+  <button id="merge-notes">🔗 Fusionar</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script>
+/* =====================================================================
+   VARIABLES PRINCIPALES
+   ===================================================================== */
+const board=document.getElementById("board");
+const menuBg=document.getElementById("context-menu");
+const menuNote=document.getElementById("context-menu-note");
+const btnNewNote=document.getElementById("new-note");
+const btnLoadSchema=document.getElementById("load-schema");
+const btnSaveSchema=document.getElementById("save-schema");
+const btnSaveImage=document.getElementById("save-image");
+const btnToggleDarkMode=document.getElementById("toggle-dark-mode");
+const btnDeleteNote=document.getElementById("delete-note");
+const btnDuplicateNote=document.getElementById("duplicate-note");
+const btnMergeNotes=document.getElementById("merge-notes");
+
+let notes=[];
+let selectedIds=new Set();
+let zCounter=1;
+
+let selectionRect=null;
+let selectionStart=null;
+let ctrlHeld=false;
+let contextClickPos={x:0,y:0};
+let wasSelecting=false;
+
+/* =====================================================================
+   HISTORIAL (UNDO / REDO) - OPTIMIZADO: COMMAND PATTERN
+   ===================================================================== */
+let history = []; // Almacena comandos ejecutados
+let redoStack = []; // Almacena comandos deshechos
+const MAX_HISTORY = 200;
+
+// =====================================================================
+// DEFINICIÓN DE COMANDOS
+// =====================================================================
+
+// Comando para guardar el estado después de una edición de texto
+function EditNoteCommand(id, textBefore, textAfter) {
+    this.id = id;
+    this.textBefore = textBefore;
+    this.textAfter = textAfter;
+
+    const applyText = (text) => {
+        const note = notes.find(n => n.id === this.id);
+        if (note) note.text = text;
+    };
+
+    this.execute = () => { applyText(this.textAfter); };
+    this.undo = () => { applyText(this.textBefore); };
+}
+
+// Comando para mover notas
+function MoveNotesCommand(positionsBefore, positionsAfter) {
+    this.positionsBefore = positionsBefore; 
+    this.positionsAfter = positionsAfter;   
+    
+    const applyPositions = (positions) => {
+        positions.forEach(p => {
+            const note = notes.find(n => n.id === p.id);
+            if (note) {
+                note.x = p.x;
+                note.y = p.y;
+            }
+        });
+    };
+
+    this.execute = () => { applyPositions(this.positionsAfter); };
+    this.undo = () => { applyPositions(this.positionsBefore); };
+}
+
+// Comando para crear una nota
+function NewNoteCommand(note) {
+    this.note = note;
+    this.execute = () => { notes.push(this.note); };
+    this.undo = () => { notes = notes.filter(n => n.id !== this.note.id); };
+}
+
+// Comando para eliminar notas
+function DeleteNotesCommand(deletedNotes) {
+    this.deletedNotes = deletedNotes; 
+
+    this.execute = () => {
+        const deletedIds = new Set(this.deletedNotes.map(n => n.id));
+        notes = notes.filter(n => !deletedIds.has(n.id));
+    };
+
+    this.undo = () => {
+        // Añadir las notas de vuelta al array, manteniendo el orden de z-index
+        this.deletedNotes.forEach(deletedNote => {
+            const index = notes.findIndex(n => n.z > deletedNote.z);
+            if (index === -1) notes.push(deletedNote);
+            else notes.splice(index, 0, deletedNote);
+        });
+    };
+}
+
+// Comando para duplicar notas
+function DuplicateNotesCommand(originalNotes, newNotes) {
+    this.originalNotes = originalNotes;
+    this.newNotes = newNotes;
+
+    this.execute = () => {
+        notes = [...notes, ...this.newNotes];
+    };
+    this.undo = () => {
+        const newIds = new Set(this.newNotes.map(n => n.id));
+        notes = notes.filter(n => !newIds.has(n.id));
+    };
+}
+
+// Comando para fusionar notas
+function MergeNotesCommand(targetNoteId, textBefore, textAfter, deletedNotes) {
+    this.targetNoteId = targetNoteId; // ID de la nota resultante
+    this.textBefore = textBefore;   // Texto original de la nota resultante
+    this.textAfter = textAfter;     // Texto después de la fusión
+    this.deletedNotes = deletedNotes; // Array de notas eliminadas (incluyendo sus datos completos)
+
+    // EXECUTE: Fusiona el texto y elimina las notas redundantes.
+    this.execute = () => {
+        // 1. Aplicar el nuevo texto a la nota resultante
+        const targetNote = notes.find(n => n.id === this.targetNoteId);
+        if (targetNote) targetNote.text = this.textAfter;
+
+        // 2. Filtrar las notas eliminadas (el array 'notes' ahora contiene la resultante + las no afectadas)
+        const deletedIds = new Set(this.deletedNotes.map(n => n.id));
+        notes = notes.filter(n => !deletedIds.has(n.id));
+    };
+
+    // UNDO: Restaura el texto original y reinserta las notas eliminadas.
+    this.undo = () => {
+        // 1. Restaurar el texto original a la nota resultante
+        const targetNote = notes.find(n => n.id === this.targetNoteId);
+        if (targetNote) targetNote.text = this.textBefore;
+
+        // 2. Combinar: [Notas actuales (No afectadas + Resultante)] + [Notas eliminadas]
+        // NOTA: 'notes' ya contiene las notas que no fueron borradas. Solo hay que añadir las borradas.
+        const allNotes = [...notes, ...this.deletedNotes];
+
+        // 3. Reordenar todo por Z-index para asegurar que se restaura el orden original.
+        notes = allNotes.sort((a,b)=>a.z-b.z);
+    };
+}
+
+// =====================================================================
+// FUNCIONES DEL HISTORIAL
+// =====================================================================
+
+/**
+ * Registra y ejecuta una acción (comando) en el historial.
+ * @param {object} command - Objeto con métodos execute y undo.
+ */
+function executeCommand(command) {
+  history.push(command);
+  if (history.length > MAX_HISTORY) history.shift();
+  redoStack = [];
+  command.execute(); // Ejecuta la acción inmediatamente
+  render();
+}
+
+function undo() {
+  if (history.length === 0) return;
+  const command = history.pop();
+  command.undo();
+  redoStack.push(command);
+  selectedIds.clear();
+  render();
+}
+
+function redo() {
+  if (redoStack.length === 0) return;
+  const command = redoStack.pop();
+  command.execute();
+  history.push(command);
+  selectedIds.clear();
+  render();
+}
+
+// Función auxiliar para actualizar el estado del tablero (usada en Load)
+function updateState(newNotes) {
+    notes = newNotes;
+    zCounter = Math.max(...notes.map(n=>n.z),0);
+    selectedIds.clear();
+    render();
+}
+
+
+/* =====================================================================
+   RENDER
+   ===================================================================== */
+function render(){
+  board.querySelectorAll(".note").forEach(n=>n.remove());
+
+  notes.slice().sort((a,b)=>a.z-b.z).forEach(n=>{
+    const el=document.createElement("div");
+    el.className="note";
+    if(selectedIds.has(n.id)) el.classList.add("selected");
+
+    el.style.left=n.x+"px";
+    el.style.top=n.y+"px";
+    el.style.zIndex=n.z;
+    el.dataset.id=n.id;
+
+    el.textContent=n.text.trim()===""?"":n.text;
+    if(n.text.trim()===""){
+      const ph=document.createElement("span");
+      ph.className="placeholder";
+      ph.textContent="...";
+      el.appendChild(ph);
+    }
+
+    /* === ARRASTRE === */
+    let dragging=false, lastX=0, lastY=0;
+    let positionsBeforeDrag = []; // Almacena la posición inicial para el comando
+
+    el.addEventListener("mousedown",e=>{
+      if(e.detail>1 || el.isContentEditable) return;
+      e.stopPropagation();
+
+      const id=n.id;
+
+      if(e.ctrlKey){
+        if(selectedIds.has(id)) selectedIds.delete(id);
+        else selectedIds.add(id);
+        render();
+        return;
+      }
+
+      if(!selectedIds.has(id)){
+        selectedIds.clear();
+        selectedIds.add(id);
+      }
+
+      bringSelectionToFront();
+
+      // Captura de posiciones ANTES del arrastre
+      positionsBeforeDrag = [];
+      notes.forEach(x => {
+          if (selectedIds.has(x.id)) {
+              positionsBeforeDrag.push({ id: x.id, x: x.x, y: x.y });
+          }
+      });
+      
+      dragging=true;
+      lastX=e.clientX;
+      lastY=e.clientY;
+
+      function handleMouseUpDrag() {
+          if (!dragging) return;
+          dragging = false;
+
+          // Capturar posiciones FINALES
+          let positionsAfterDrag = [];
+          notes.forEach(x => {
+              if (selectedIds.has(x.id)) {
+                  positionsAfterDrag.push({ id: x.id, x: x.x, y: x.y });
+              }
+          });
+          
+          // Crear y ejecutar comando solo si las posiciones cambiaron (arrastre real)
+          if (!arePositionsEqual(positionsBeforeDrag, positionsAfterDrag)) {
+              executeCommand(new MoveNotesCommand(positionsBeforeDrag, positionsAfterDrag));
+          }
+          
+          window.removeEventListener("mouseup", handleMouseUpDrag);
+      }
+      
+      function arePositionsEqual(arr1, arr2) {
+          if (arr1.length !== arr2.length) return false;
+          for (let i = 0; i < arr1.length; i++) {
+              if (arr1[i].x !== arr2[i].x || arr1[i].y !== arr2[i].y) {
+                  return false;
+              }
+          }
+          return true;
+      }
+      
+      window.addEventListener("mouseup", handleMouseUpDrag);
+    });
+
+    window.addEventListener("mousemove",e=>{
+      if(!dragging) return;
+
+      const dx=e.clientX-lastX;
+      const dy=e.clientY-lastY;
+      lastX=e.clientX;
+      lastY=e.clientY;
+
+      notes.forEach(x=>{
+        if(selectedIds.has(x.id)){
+          x.x+=dx;
+          x.y+=dy;
+          const el2=document.querySelector(`.note[data-id="${x.id}"]`);
+          if(el2){
+            el2.style.left=x.x+"px";
+            el2.style.top=x.y+"px";
+          }
+        }
+      });
+    });
+
+    // El listener de mouseup global anterior se ha movido dentro del mousedown para gestionar el comando de movimiento.
+    // Solo dejamos la variable dragging a false al inicio, el listener temporal se encarga de todo.
+
+    /* === EDICIÓN === */
+    el.addEventListener("dblclick",e=>{
+      e.stopPropagation();
+
+      // Edición estandarizada con contentEditable
+      startEditing(el,n.id);
+    });
+
+    /* === MENÚ CONTEXTUAL DE NOTA === */
+	el.addEventListener("contextmenu",e=>{
+	e.preventDefault();
+	e.stopPropagation();
+	if(!selectedIds.has(n.id)){
+		selectedIds.clear();
+		selectedIds.add(n.id);
+		render();
+	}
+	// === Lógica de visibilidad ===
+	if (selectedIds.size >= 2) {
+		btnMergeNotes.style.display = 'block';
+	} else {
+		btnMergeNotes.style.display = 'none';
+	}
+	// =============================
+	menuNote.style.display="block";
+	menuNote.style.left=e.clientX+"px";
+	menuNote.style.top=e.clientY+"px";
+	});
+
+    board.appendChild(el);
+  });
+}
+
+/* =====================================================================
+   FUNCIONES DE NOTAS
+   ===================================================================== */
+function bringSelectionToFront(){
+  if(selectedIds.size===0) return;
+
+  const sel = notes.filter(n=>selectedIds.has(n.id));
+  const rest = notes.filter(n=>!selectedIds.has(n.id));
+  const maxZ = Math.max(...notes.map(n=>n.z),0);
+
+  let nextZ = maxZ+1;
+  sel.forEach(n => n.z = nextZ++);
+
+  zCounter = nextZ;
+  notes=[...rest,...sel];
+  render();
+}
+
+function startEditing(el,id){
+  const note=notes.find(n=>n.id===id); if(!note) return;
+  const textBefore = note.text; // Captura el texto antes de la edición
+
+  el.contentEditable=true;
+  el.focus();
+  const ph=el.querySelector(".placeholder");
+  if(ph) ph.remove();
+
+  // Posicionar cursor al final del texto
+  const range = document.createRange();
+  const sel = window.getSelection();
+
+  if (el.childNodes.length > 0) {
+    const lastChild = el.childNodes[el.childNodes.length - 1];
+    
+    if (lastChild.nodeType === 3) { // Node.TEXT_NODE
+      range.setStart(lastChild, lastChild.length);
+      range.collapse(true);
+    } else {
+      range.selectNodeContents(el);
+      range.collapse(false);
+    }
+  }
+  sel.removeAllRanges();
+  sel.addRange(range);
+  // Fin de posicionamiento del cursor
+
+  function finish(){
+    el.removeEventListener("blur",finish);
+    el.removeEventListener("keydown",handleKey);
+    el.contentEditable=false;
+    const textAfter = el.textContent.trim();
+
+    if(textBefore !== textAfter){
+        // Guardamos la edición como un comando
+        executeCommand(new EditNoteCommand(id, textBefore, textAfter));
+    } else {
+        // Si no hay cambio, solo renderiza para limpiar estilos
+        notes = notes.map(n=>n.id===id ? {...n,text:textAfter} : n);
+        render();
+    }
+  }
+  function handleKey(e){
+    if(e.key==="Enter" && !e.shiftKey){
+      e.preventDefault();
+      el.blur();
+    }
+  }
+  el.addEventListener("blur",finish);
+  el.addEventListener("keydown",handleKey);
+}
+
+function newNote(x=null,y=null){
+  if(x===null || y===null){
+    const rect=board.getBoundingClientRect();
+    x=rect.width/2-50;
+    y=rect.height/2-25;
+  }
+
+  const note={
+    id:crypto.randomUUID(),
+    x,y,
+    text:"",
+    z:++zCounter
+  };
+
+  executeCommand(new NewNoteCommand(note));
+  
+  selectedIds.clear();
+  selectedIds.add(note.id);
+  bringSelectionToFront();
+
+  setTimeout(()=>{
+    const el=document.querySelector(`.note[data-id="${note.id}"]`);
+    if(el) startEditing(el,note.id);
+  },0);
+}
+
+/* =====================================================================
+   GUARDAR / CARGAR / IMAGEN
+   ===================================================================== */
+function saveSchema(){
+  const blob=new Blob([JSON.stringify(notes,null,2)],{type:"application/json"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="esquema.json";
+  a.click();
+}
+
+function loadSchema(){
+  const input=document.createElement("input");
+  input.type="file";
+  input.accept=".json";
+
+  input.onchange=e=>{
+    const f=e.target.files[0];
+    if(!f) return;
+
+    const reader=new FileReader();
+    reader.onload=()=>{
+      try{
+        const data=JSON.parse(reader.result);
+        if(Array.isArray(data)){
+          // Al cargar, no usamos executeCommand, solo actualizamos el estado.
+          // Además, limpiamos el historial al cargar un nuevo esquema.
+          history = [];
+          redoStack = [];
+          updateState(data);
+        }
+      }catch{
+        alert("Archivo inválido.");
+      }
+    };
+    reader.readAsText(f);
+  };
+
+  input.click();
+}
+
+async function saveImage(){
+  const transparent = confirm("¿Deseas fondo transparente?");
+
+  // 1. Determinar si el tema oscuro está activo
+  const isDarkMode = document.body.classList.contains('dark-mode');
+
+  // 2. Establecer el color de fondo adecuado (oscuro o claro)
+  const defaultLightBackground = "#f0f0f0"; // Color de fondo del modo claro (base)
+  const defaultDarkBackground = "#000000";  // Color de fondo del modo oscuro
+  
+  const selectedBackgroundColor = isDarkMode ? defaultDarkBackground : defaultLightBackground;
+
+  // 3. Aplicar 'null' si es transparente, o el color de fondo seleccionado si no lo es
+  const finalBackgroundColor = transparent ? null : selectedBackgroundColor;
+  
+  // 4. Pasar el color dinámico a html2canvas
+  const canvas = await html2canvas(board,{
+      backgroundColor: finalBackgroundColor
+  });
+  
+  const a=document.createElement("a");
+  a.download="esquema.png";
+  a.href=canvas.toDataURL("image/png");
+  a.click();
+}
+
+/* =====================================================================
+   MENÚS CONTEXTUALES
+   ===================================================================== */
+board.addEventListener("contextmenu",e=>{
+  if(e.target!==board) return;
+  e.preventDefault();
+
+  menuNote.style.display="none";
+
+  const rect=board.getBoundingClientRect();
+  contextClickPos={x:e.clientX-rect.left,y:e.clientY-rect.top};
+
+  menuBg.style.display="block";
+  menuBg.style.left=e.clientX+"px";
+  menuBg.style.top=e.clientY+"px";
+});
+
+document.addEventListener("click",e=>{
+  if(!menuBg.contains(e.target)) menuBg.style.display="none";
+  if(!menuNote.contains(e.target)) menuNote.style.display="none";
+});
+
+/* =====================================================================
+   DOBLE CLIC PARA NUEVA NOTA
+   ===================================================================== */
+board.addEventListener("dblclick",e=>{
+  if(e.target===board){
+    const rect=board.getBoundingClientRect();
+    newNote(e.clientX-rect.left, e.clientY-rect.top);
+  }
+});
+
+/* =====================================================================
+   ATAJOS DE TECLADO
+   ===================================================================== */
+window.addEventListener("keydown",e=>{
+  ctrlHeld = e.ctrlKey;
+  const isEditing = document.activeElement.contentEditable === 'true';
+
+  /* ==== Undo / Redo ==== */
+  if(e.ctrlKey && e.key.toLowerCase()==="z"){
+    e.preventDefault();
+    if(e.shiftKey) redo();
+    else undo();
+    return;
+  }
+
+  if(e.ctrlKey && e.key.toLowerCase()==="y"){
+    e.preventDefault();
+    redo();
+    return;
+  }
+
+  /* ==== Guardar / Cargar / Imagen ==== */
+  if(e.ctrlKey && e.key.toLowerCase()==="s"){
+    e.preventDefault();
+    saveSchema();
+    return;
+  }
+  else if(e.ctrlKey && e.key.toLowerCase()==="p"){
+    e.preventDefault();
+    saveImage();
+    return;
+  }
+  else if(e.ctrlKey && e.key.toLowerCase()==="o"){
+    e.preventDefault();
+    loadSchema();
+    return;
+  }
+
+	/* ==== Seleccionar todo (Ctrl + A) ==== */
+  if(e.ctrlKey && e.key.toLowerCase() === "a"){
+    // Solo seleccionamos todo si NO estamos editando texto dentro de una nota
+    if(!isEditing){
+      e.preventDefault(); // Evita la selección de texto nativa del navegador
+      
+      // Añadimos todas las IDs de las notas al Set de selección
+      selectedIds = new Set(notes.map(n => n.id));
+      
+      render();
+    }
+    return;
+  }
+
+  /* ==== Eliminar con Supr / Delete / Backspace (SOLO si no editamos) ==== */
+  const isDeleteKey = e.key === "Delete" || e.key === "Backspace";
+
+  if (isDeleteKey && !isEditing && selectedIds.size > 0) {
+    e.preventDefault(); 
+    
+    // Ejecutamos la lógica de eliminación como si fuera el botón
+    deleteSelectedNotes(); 
+    return;
+  }
+});
+
+window.addEventListener("keyup",e=>{ ctrlHeld=e.ctrlKey; });
+
+/* =====================================================================
+   SELECCIÓN MÚLTIPLE (ARRASTRE)
+   ===================================================================== */
+board.addEventListener("mousedown",e=>{
+  if(e.target!==board) return;
+  e.preventDefault();
+
+  const rect=board.getBoundingClientRect();
+  selectionStart={x:e.clientX-rect.left,y:e.clientY-rect.top};
+
+  selectionRect=document.createElement("div");
+  selectionRect.className="selection-rect";
+  board.appendChild(selectionRect);
+  wasSelecting=false;
+});
+
+window.addEventListener("mousemove",e=>{
+  if(!selectionStart) return;
+
+  const rectB=board.getBoundingClientRect();
+  const x=e.clientX-rectB.left;
+  const y=e.clientY-rectB.top;
+
+  const x1=Math.min(selectionStart.x,x);
+  const y1=Math.min(selectionStart.y,y);
+  const x2=Math.max(selectionStart.x,x);
+  const y2=Math.max(selectionStart.y,y);
+
+  Object.assign(selectionRect.style,{
+    left:x1+"px",
+    top:y1+"px",
+    width:(x2-x1)+"px",
+    height:(y2-y1)+"px"
+  });
+
+  wasSelecting=true;
+
+  const newly=new Set();
+
+  notes.forEach(n=>{
+    const el=document.querySelector(`.note[data-id="${n.id}"]`);
+    if(!el) return;
+
+    const r=el.getBoundingClientRect();
+    const b=board.getBoundingClientRect();
+
+    const nx1=r.left-b.left,
+          ny1=r.top-b.top,
+          nx2=nx1+r.width,
+          ny2=ny1+r.height;
+
+    const intersects = !(nx2<x1 || nx1>x2 || ny2<y1 || ny1>y2);
+    if(intersects) newly.add(n.id);
+  });
+
+  selectedIds = ctrlHeld ? new Set([...selectedIds,...newly]) : newly;
+  render();
+});
+
+window.addEventListener("mouseup",()=>{
+  if(selectionRect) selectionRect.remove();
+  selectionRect=null;
+  selectionStart=null;
+});
+
+board.addEventListener("click",e=>{
+  if(e.target===board && !wasSelecting){
+    selectedIds.clear();
+    render();
+  }
+  wasSelecting=false;
+});
+
+/* =====================================================================
+   LÓGICA DE BOTONES Y ACCIONES
+   ===================================================================== */
+function deleteSelectedNotes(){
+    if(selectedIds.size===0) return;
+    const deleted = notes.filter(n=>selectedIds.has(n.id));
+
+    executeCommand(new DeleteNotesCommand(deleted));
+
+    selectedIds.clear();
+    menuNote.style.display="none";
+}
+
+function mergeSelectedNotes(){
+    // Solo permitir la fusión si hay 2 o más notas seleccionadas
+    if(selectedIds.size < 2) return;
+
+    // 1. Obtener y ordenar las notas seleccionadas por posición Y (de arriba abajo)
+    const selectedNotes = notes
+        .filter(n => selectedIds.has(n.id))
+        .sort((a, b) => a.y - b.y); 
+
+    // 2. La primera nota (la más alta) será la nota resultante
+    const targetNote = selectedNotes[0];
+    const notesToMerge = selectedNotes.slice(1); // Las notas que serán eliminadas
+
+    // 3. Capturar el texto actual de la nota resultante para el "undo"
+    const textBefore = targetNote.text;
+
+    // 4. Fusionar textos (incluyendo el texto de la nota resultante)
+    const mergedTexts = selectedNotes.map(n => n.text);
+    const textAfter = mergedTexts.join('\n\n'); // Separar por dos saltos de línea para legibilidad
+
+    // 5. Preparar la lista de notas que serán eliminadas (para el comando)
+    const deletedNotes = notesToMerge;
+    
+    // 6. Ejecutar el comando de Fusión
+    executeCommand(new MergeNotesCommand(targetNote.id, textBefore, textAfter, deletedNotes));
+
+    // 7. Limpiar la selección y el menú
+    selectedIds.clear();
+    selectedIds.add(targetNote.id); // Solo la nota resultante queda seleccionada
+    menuNote.style.display = "none";
+}
+
+btnMergeNotes.onclick=()=>{
+  mergeSelectedNotes();
+};
+
+btnNewNote.onclick=()=>{
+  newNote(contextClickPos.x, contextClickPos.y);
+  menuBg.style.display="none";
+};
+
+btnLoadSchema.onclick=()=>{
+  loadSchema();
+  menuBg.style.display="none";
+};
+
+btnSaveSchema.onclick=()=>{
+  saveSchema();
+  menuBg.style.display="none";
+};
+
+btnSaveImage.onclick=()=>{
+  saveImage();
+  menuBg.style.display="none";
+};
+
+btnToggleDarkMode.onclick=()=>{
+  toggleDarkMode();
+  menuBg.style.display="none";
+};
+
+btnDeleteNote.onclick=()=>{
+  deleteSelectedNotes();
+};
+
+btnDuplicateNote.onclick=()=>{
+  if(selectedIds.size===0) return;
+
+  const sel=notes.filter(n=>selectedIds.has(n.id));
+  const newOnes = sel.map(n=>({
+    ...n,
+    id:crypto.randomUUID(),
+    x:n.x+20,
+    y:n.y+20,
+    z:++zCounter
+  }));
+
+  executeCommand(new DuplicateNotesCommand(sel, newOnes));
+
+  selectedIds=new Set(newOnes.map(n=>n.id));
+  bringSelectionToFront();
+  menuNote.style.display="none";
+};
+
+/* =====================================================================
+   INICIO
+   ===================================================================== */
+render();
+
+/* =====================================================================
+   TEMA OSCURO
+   ===================================================================== */
+function toggleDarkMode(){
+  const body = document.body;
+  const isDarkMode = body.classList.toggle('dark-mode');
+  
+  // Opcional: Guardar la preferencia en el almacenamiento local
+  localStorage.setItem('darkMode', isDarkMode ? 'enabled' : 'disabled');
+
+  // Actualizar el texto del botón del menú (si está abierto)
+  const btn = document.getElementById('toggle-dark-mode');
+  if (btn) {
+    btn.textContent = isDarkMode ? '☀️ Tema Claro' : '🌙 Tema Oscuro';
+  }
+}
+
+// Cargar la preferencia al inicio
+(function initDarkMode() {
+  const savedPreference = localStorage.getItem('darkMode');
+  if (savedPreference === 'enabled') {
+    document.body.classList.add('dark-mode');
+  }
+  
+  // Asegurarse de que el texto inicial del botón sea correcto
+  const btn = document.getElementById('toggle-dark-mode');
+  if (btn) {
+    const isDarkMode = document.body.classList.contains('dark-mode');
+    btn.textContent = isDarkMode ? '☀️ Alternar Tema Claro' : '🌙 Alternar Tema Oscuro';
+  }
+})();
+
+</script>
+</body>
+</html>

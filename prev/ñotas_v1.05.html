@@ -1,0 +1,620 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ñotas</title>
+<style>
+  body {
+    margin: 0;
+    height: 100vh;
+    background: #f0f0f0;
+    font-family: sans-serif;
+    overflow: hidden;
+  }
+  #board {
+    width: 100%;
+    height: 100%;
+    position: relative;
+    overflow: hidden;
+  }
+  .note {
+    position: absolute;
+    min-width: 60px;
+    max-width: 400px;
+    background: white;
+    border: 2px solid black;
+    border-radius: 10px;
+    padding: 8px 10px;
+    box-sizing: border-box;
+    user-select: none;
+    cursor: grab;
+    white-space: pre-wrap;
+    word-wrap: break-word;
+    text-align: center;
+  }
+  .note:active { cursor: grabbing; }
+  .note.selected { outline: 2px dashed #00aaff; }
+  .placeholder { color: #bbb; font-style: italic; }
+
+  .selection-rect {
+    position: absolute;
+    border: 1px dashed #00aaff;
+    background: rgba(0, 170, 255, 0.15);
+    pointer-events: none;
+    z-index: 9999;
+  }
+
+  .context-menu {
+    position: absolute;
+    background: white;
+    border: 1px solid #ccc;
+    border-radius: 8px;
+    box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    display: none;
+    z-index: 10000;
+    overflow: hidden;
+  }
+  .context-menu button {
+    display: block;
+    width: 100%;
+    padding: 10px 20px;
+    background: none;
+    border: none;
+    text-align: left;
+    cursor: pointer;
+    font-size: 14px;
+  }
+  .context-menu button:hover {
+    background: #0078d4;
+    color: white;
+  }
+</style>
+</head>
+<body>
+<div id="board"></div>
+
+<!-- Menú contextual del fondo -->
+<div id="context-menu" class="context-menu">
+  <button id="new-note">🟨 Nueva nota</button>
+  <button id="load-schema">📂 Cargar esquema (Ctrl+O)</button>
+  <button id="save-schema">💾 Guardar esquema (Ctrl+S)</button>
+  <button id="save-image">🖼️ Guardar imagen (Ctrl+P)</button>
+</div>
+
+<!-- Menú contextual sobre notas -->
+<div id="context-menu-note" class="context-menu">
+  <button id="delete-note">🗑️ Eliminar nota(s)</button>
+  <button id="duplicate-note">📄 Duplicar nota(s)</button>
+</div>
+
+<script src="https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js"></script>
+<script>
+/* =====================================================================
+   VARIABLES PRINCIPALES
+   ===================================================================== */
+const board=document.getElementById("board");
+const menuBg=document.getElementById("context-menu");
+const menuNote=document.getElementById("context-menu-note");
+const btnNewNote=document.getElementById("new-note");
+const btnLoadSchema=document.getElementById("load-schema");
+const btnSaveSchema=document.getElementById("save-schema");
+const btnSaveImage=document.getElementById("save-image");
+const btnDeleteNote=document.getElementById("delete-note");
+const btnDuplicateNote=document.getElementById("duplicate-note");
+
+let notes=[];
+let selectedIds=new Set();
+let zCounter=1;
+
+let selectionRect=null;
+let selectionStart=null;
+let ctrlHeld=false;
+let contextClickPos={x:0,y:0};
+let wasSelecting=false;
+
+/* =====================================================================
+   HISTORIAL (UNDO / REDO)
+   ===================================================================== */
+let history = [];
+let redoStack = [];
+const MAX_HISTORY = 200;
+
+function saveState() {
+  history.push(structuredClone(notes));
+  if (history.length > MAX_HISTORY) history.shift();
+  redoStack = [];
+}
+
+function undo() {
+  if (history.length === 0) return;
+  redoStack.push(structuredClone(notes));
+  notes = structuredClone(history.pop());
+  selectedIds.clear();
+  render();
+}
+
+function redo() {
+  if (redoStack.length === 0) return;
+  history.push(structuredClone(notes));
+  notes = structuredClone(redoStack.pop());
+  selectedIds.clear();
+  render();
+}
+
+function pushHistory(newState){
+  saveState();
+  notes = structuredClone(newState);
+  render();
+}
+
+/* =====================================================================
+   RENDER
+   ===================================================================== */
+function render(){
+  board.querySelectorAll(".note").forEach(n=>n.remove());
+
+  notes.slice().sort((a,b)=>a.z-b.z).forEach(n=>{
+    const el=document.createElement("div");
+    el.className="note";
+    if(selectedIds.has(n.id)) el.classList.add("selected");
+
+    el.style.left=n.x+"px";
+    el.style.top=n.y+"px";
+    el.style.zIndex=n.z;
+    el.dataset.id=n.id;
+
+    el.textContent=n.text.trim()===""?"":n.text;
+    if(n.text.trim()===""){
+      const ph=document.createElement("span");
+      ph.className="placeholder";
+      ph.textContent="...";
+      el.appendChild(ph);
+    }
+
+    /* === ARRASTRE === */
+    let dragging=false, lastX=0, lastY=0;
+
+    el.addEventListener("mousedown",e=>{
+      if(e.detail>1 || el.isContentEditable) return;
+      e.stopPropagation();
+
+      const id=n.id;
+
+      if(e.ctrlKey){
+        if(selectedIds.has(id)) selectedIds.delete(id);
+        else selectedIds.add(id);
+        render();
+        return;
+      }
+
+      if(!selectedIds.has(id)){
+        selectedIds.clear();
+        selectedIds.add(id);
+      }
+
+      bringSelectionToFront();
+
+      // Guardamos el estado antes de comenzar a arrastrar
+      saveState();
+
+      dragging=true;
+      lastX=e.clientX;
+      lastY=e.clientY;
+    });
+
+    window.addEventListener("mousemove",e=>{
+      if(!dragging) return;
+
+      const dx=e.clientX-lastX;
+      const dy=e.clientY-lastY;
+      lastX=e.clientX;
+      lastY=e.clientY;
+
+      notes.forEach(x=>{
+        if(selectedIds.has(x.id)){
+          x.x+=dx;
+          x.y+=dy;
+          const el2=document.querySelector(`.note[data-id="${x.id}"]`);
+          if(el2){
+            el2.style.left=x.x+"px";
+            el2.style.top=x.y+"px";
+          }
+        }
+      });
+    });
+
+    window.addEventListener("mouseup",()=>{ dragging=false; });
+
+    /* === EDICIÓN === */
+    el.addEventListener("dblclick",e=>{
+      e.stopPropagation();
+
+      startEditing(el,n.id);
+    });
+
+    /* === MENÚ CONTEXTUAL DE NOTA === */
+    el.addEventListener("contextmenu",e=>{
+      e.preventDefault();
+      e.stopPropagation();
+      if(!selectedIds.has(n.id)){
+        selectedIds.clear();
+        selectedIds.add(n.id);
+        render();
+      }
+      menuNote.style.display="block";
+      menuNote.style.left=e.clientX+"px";
+      menuNote.style.top=e.clientY+"px";
+    });
+
+    board.appendChild(el);
+  });
+}
+
+/* =====================================================================
+   FUNCIONES DE NOTAS
+   ===================================================================== */
+function bringSelectionToFront(){
+  if(selectedIds.size===0) return;
+
+  const sel = notes.filter(n=>selectedIds.has(n.id));
+  const rest = notes.filter(n=>!selectedIds.has(n.id));
+  const maxZ = Math.max(...notes.map(n=>n.z),0);
+
+  let nextZ = maxZ+1;
+  sel.forEach(n => n.z = nextZ++);
+
+  zCounter = nextZ;
+  notes=[...rest,...sel];
+  render();
+}
+
+function startEditing(el,id){
+  const note=notes.find(n=>n.id===id); if(!note) return;
+
+  el.contentEditable=true;
+  el.focus();
+  const ph=el.querySelector(".placeholder");
+  if(ph) ph.remove();
+
+  // 1. Crear un rango de selección
+  const range = document.createRange();
+  // 2. Crear un objeto de selección global
+  const sel = window.getSelection();
+
+  // 3. Si el elemento tiene contenido (nodos de texto)
+  if (el.childNodes.length > 0) {
+    // Apuntar el rango al último nodo hijo (que contendrá el texto)
+    const lastChild = el.childNodes[el.childNodes.length - 1];
+    
+    // Si es un nodo de texto, colapsar el rango al final del contenido
+    if (lastChild.nodeType === 3) { // Node.TEXT_NODE
+      range.setStart(lastChild, lastChild.length);
+      range.collapse(true);
+    } else {
+      // Si el contenido es complejo o vacío, simplemente establecer el final del elemento
+      range.selectNodeContents(el);
+      range.collapse(false);
+    }
+  }
+
+  // 4. Limpiar cualquier selección previa y aplicar el nuevo rango
+  sel.removeAllRanges();
+  sel.addRange(range);
+
+  function finish(){
+    el.removeEventListener("blur",finish);
+    el.removeEventListener("keydown",handleKey);
+    el.contentEditable=false;
+    const text=el.textContent.trim();
+
+    saveState();
+    notes = notes.map(n=>n.id===id ? {...n,text} : n);
+    render();
+  }
+  function handleKey(e){
+    if(e.key==="Enter" && !e.shiftKey){
+      e.preventDefault();
+      el.blur();
+    }
+  }
+  el.addEventListener("blur",finish);
+  el.addEventListener("keydown",handleKey);
+}
+
+function newNote(x=null,y=null){
+  if(x===null || y===null){
+    const rect=board.getBoundingClientRect();
+    x=rect.width/2-50;
+    y=rect.height/2-25;
+  }
+
+  const note={
+    id:crypto.randomUUID(),
+    x,y,
+    text:"",
+    z:++zCounter
+  };
+
+  saveState();
+  notes.push(note);
+  selectedIds.clear();
+  selectedIds.add(note.id);
+  bringSelectionToFront();
+
+  setTimeout(()=>{
+    const el=document.querySelector(`.note[data-id="${note.id}"]`);
+    if(el) startEditing(el,note.id);
+  },0);
+}
+
+/* =====================================================================
+   GUARDAR / CARGAR / IMAGEN
+   ===================================================================== */
+function saveSchema(){
+  const blob=new Blob([JSON.stringify(notes,null,2)],{type:"application/json"});
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(blob);
+  a.download="esquema.json";
+  a.click();
+}
+
+function loadSchema(){
+  const input=document.createElement("input");
+  input.type="file";
+  input.accept=".json";
+
+  input.onchange=e=>{
+    const f=e.target.files[0];
+    if(!f) return;
+
+    const reader=new FileReader();
+    reader.onload=()=>{
+      try{
+        const data=JSON.parse(reader.result);
+        if(Array.isArray(data)){
+          saveState();
+          notes=data;
+          zCounter=Math.max(...notes.map(n=>n.z),0);
+          selectedIds.clear();
+          render();
+        }
+      }catch{
+        alert("Archivo inválido.");
+      }
+    };
+    reader.readAsText(f);
+  };
+
+  input.click();
+}
+
+async function saveImage(){
+  const transparent = confirm("¿Deseas fondo transparente?");
+  const canvas = await html2canvas(board,{backgroundColor:transparent?null:"#f0f0f0"});
+  const a=document.createElement("a");
+  a.download="esquema.png";
+  a.href=canvas.toDataURL("image/png");
+  a.click();
+}
+
+/* =====================================================================
+   MENÚS CONTEXTUALES
+   ===================================================================== */
+board.addEventListener("contextmenu",e=>{
+  if(e.target!==board) return;
+  e.preventDefault();
+
+  menuNote.style.display="none";
+
+  const rect=board.getBoundingClientRect();
+  contextClickPos={x:e.clientX-rect.left,y:e.clientY-rect.top};
+
+  menuBg.style.display="block";
+  menuBg.style.left=e.clientX+"px";
+  menuBg.style.top=e.clientY+"px";
+});
+
+document.addEventListener("click",e=>{
+  if(!menuBg.contains(e.target)) menuBg.style.display="none";
+  if(!menuNote.contains(e.target)) menuNote.style.display="none";
+});
+
+/* =====================================================================
+   DOBLE CLIC PARA NUEVA NOTA
+   ===================================================================== */
+board.addEventListener("dblclick",e=>{
+  if(e.target===board){
+    const rect=board.getBoundingClientRect();
+    newNote(e.clientX-rect.left, e.clientY-rect.top);
+  }
+});
+
+/* =====================================================================
+   ATAJOS DE TECLADO
+   ===================================================================== */
+window.addEventListener("keydown",e=>{
+  ctrlHeld = e.ctrlKey;
+
+  /* ==== Undo / Redo ==== */
+  if(e.ctrlKey && e.key.toLowerCase()==="z"){
+    e.preventDefault();
+    if(e.shiftKey) redo();
+    else undo();
+    return;
+  }
+
+  if(e.ctrlKey && e.key.toLowerCase()==="y"){
+    e.preventDefault();
+    redo();
+    return;
+  }
+
+  /* ==== Guardar / Cargar / Imagen ==== */
+  if(e.ctrlKey && e.key.toLowerCase()==="s"){
+    e.preventDefault();
+    saveSchema();
+	return;
+  }
+  else if(e.ctrlKey && e.key.toLowerCase()==="p"){
+    e.preventDefault();
+    saveImage();
+	return;
+  }
+  else if(e.ctrlKey && e.key.toLowerCase()==="o"){
+    e.preventDefault();
+    loadSchema();
+	return;
+  }
+  
+  /* ==== Eliminar con Supr / Delete / Backspace ==== */
+  const isDeleteKey = e.key === "Delete" || e.key === "Backspace";
+  const isEditing = document.activeElement.contentEditable === 'true';
+
+  if (isDeleteKey && !isEditing && selectedIds.size > 0) {
+    // Si no estamos editando y hay notas seleccionadas, eliminamos las notas.
+    e.preventDefault(); 
+    
+    saveState();
+    notes = notes.filter(n=>!selectedIds.has(n.id));
+    selectedIds.clear();
+    render();
+    return;
+  }
+  
+});
+
+window.addEventListener("keyup",e=>{ ctrlHeld=e.ctrlKey; });
+
+/* =====================================================================
+   SELECCIÓN MÚLTIPLE (ARRASTRE)
+   ===================================================================== */
+board.addEventListener("mousedown",e=>{
+  if(e.target!==board) return;
+  e.preventDefault();
+
+  const rect=board.getBoundingClientRect();
+  selectionStart={x:e.clientX-rect.left,y:e.clientY-rect.top};
+
+  selectionRect=document.createElement("div");
+  selectionRect.className="selection-rect";
+  board.appendChild(selectionRect);
+  wasSelecting=false;
+});
+
+window.addEventListener("mousemove",e=>{
+  if(!selectionStart) return;
+
+  const rectB=board.getBoundingClientRect();
+  const x=e.clientX-rectB.left;
+  const y=e.clientY-rectB.top;
+
+  const x1=Math.min(selectionStart.x,x);
+  const y1=Math.min(selectionStart.y,y);
+  const x2=Math.max(selectionStart.x,x);
+  const y2=Math.max(selectionStart.y,y);
+
+  Object.assign(selectionRect.style,{
+    left:x1+"px",
+    top:y1+"px",
+    width:(x2-x1)+"px",
+    height:(y2-y1)+"px"
+  });
+
+  wasSelecting=true;
+
+  const newly=new Set();
+
+  notes.forEach(n=>{
+    const el=document.querySelector(`.note[data-id="${n.id}"]`);
+    if(!el) return;
+
+    const r=el.getBoundingClientRect();
+    const b=board.getBoundingClientRect();
+
+    const nx1=r.left-b.left,
+          ny1=r.top-b.top,
+          nx2=nx1+r.width,
+          ny2=ny1+r.height;
+
+    const intersects = !(nx2<x1 || nx1>x2 || ny2<y1 || ny1>y2);
+    if(intersects) newly.add(n.id);
+  });
+
+  selectedIds = ctrlHeld ? new Set([...selectedIds,...newly]) : newly;
+  render();
+});
+
+window.addEventListener("mouseup",()=>{
+  if(selectionRect) selectionRect.remove();
+  selectionRect=null;
+  selectionStart=null;
+});
+
+board.addEventListener("click",e=>{
+  if(e.target===board && !wasSelecting){
+    selectedIds.clear();
+    render();
+  }
+  wasSelecting=false;
+});
+
+/* =====================================================================
+   BOTONES DE MENÚS
+   ===================================================================== */
+btnNewNote.onclick=()=>{
+  newNote(contextClickPos.x, contextClickPos.y);
+  menuBg.style.display="none";
+};
+
+btnLoadSchema.onclick=()=>{
+  loadSchema();
+  menuBg.style.display="none";
+};
+
+btnSaveSchema.onclick=()=>{
+  saveSchema();
+  menuBg.style.display="none";
+};
+
+btnSaveImage.onclick=()=>{
+  saveImage();
+  menuBg.style.display="none";
+};
+
+btnDeleteNote.onclick=()=>{
+  saveState();
+  notes = notes.filter(n=>!selectedIds.has(n.id));
+  selectedIds.clear();
+  render();
+  menuNote.style.display="none";
+};
+
+btnDuplicateNote.onclick=()=>{
+  if(selectedIds.size===0) return;
+
+  saveState();
+
+  const sel=notes.filter(n=>selectedIds.has(n.id));
+  const newOnes = sel.map(n=>({
+    ...n,
+    id:crypto.randomUUID(),
+    x:n.x+20,
+    y:n.y+20,
+    z:++zCounter
+  }));
+
+  notes=[...notes,...newOnes];
+  selectedIds=new Set(newOnes.map(n=>n.id));
+  bringSelectionToFront();
+  menuNote.style.display="none";
+};
+
+/* =====================================================================
+   INICIO
+   ===================================================================== */
+render();
+
+</script>
+</body>
+</html>
