@@ -3,6 +3,7 @@
 
 <img width="1872" height="907" alt="image" src="https://github.com/user-attachments/assets/3badf76d-13b9-46ba-9aaf-e2f90bc9c4d8" />
 
+https://ualfrg982.github.io/nyotas/
 
 ## Controles y atajos del teclado
 
